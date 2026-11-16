@@ -1,0 +1,35 @@
+# The floor, as the rovers and the supervisor know it.
+# 
+# Units are metres in the frame set by the floor calibration (camera_pose.yaml).
+# "+x" is called east and "+y" north in everything people and the language
+# model read; they are names for the two floor axes, not real compass points.
+# 
+# Generated for a 4.2 x 3.2 m floor and 3 rovers by
+#     layout --width 4.2 --height 3.2 --rovers 3
+# Edit freely, then run:  simulate --check
+
+bounds: {x: [0, 4.2], y: [0, 3.2]}   # the floor the camera sees and rovers may use (m)
+edge_margin: 0.2                        # routes keep rover centres this far inside
+compass: {plus_x: east, plus_y: north}
+
+walls:                                   # lines on the floor; the gap between two is the gate
+  - {name: the north gate post, from: [1.25, 3.2], to: [1.25, 1.7]}
+  - {name: the south gate post, from: [1.25, 0.9], to: [1.25, 0]}
+
+obstacles:                               # free-standing things the reflex steers round
+  - {name: rock, x: 2.83, y: 1.25, r: 0.1}
+
+zones:                                   # named floor areas; time spent in each is scored
+  - {name: north strip, x: [1.55, 4.2], y: [2.18, 3.2]}
+
+mission:
+  turn_radius: 0.55                      # radius of the route's turns (the rover's own limit is 0.35)
+  swath: 0.3                             # width each rover "works", for the coverage score
+  lead_in: 1.9
+  start: [0.5, 2.05, -90]                  # leader start: x, y, heading in degrees (0 = east, 90 = north)
+  legs:
+    - {name: yard, to: [0.5, 1.85, -90]}
+    - {name: gate, to: [1.5, 1.3, 0]}
+    - {name: pass1, to: [3.4, 1.3, 0], work: true}
+    - {name: headland, to: [3.4, 2.4, -180]}
+    - {name: pass2, to: [1.65, 2.4, -180], work: true}

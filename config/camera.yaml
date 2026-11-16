@@ -1,0 +1,44 @@
+# The camera and the detector.
+
+intrinsics: default_cam.yaml     # lens calibration, made at the resolution below
+
+capture:
+  device: auto                   # auto = the first See3CAM found; or /dev/video2
+  width: 1920
+  height: 1080
+  fps: 60                        # See3CAM_24CUG does MJPEG 1080p at 30 / 60 / 120. 60 is a good start.
+  fourcc: MJPG
+  latency: 0.020                 # s, subtracted from the arrival time to stamp the frame (USB + decode)
+  controls:                      # applied with v4l2-ctl once the stream is running
+    auto_exposure: 1             # 1 = MANUAL on this camera
+    exposure_time_absolute: 50   # units of 100 us: 50 = 5 ms. Must stay below 1/fps (60 fps -> under 166)
+    gain: 10
+    brightness: 1
+
+detector:
+  backend: auto                  # auto | apriltag | aruco
+  decimate: 1.0                  # 1.0 = full resolution. A corner camera needs it for the far tags.
+  threads: 4
+  min_margin: 25
+  rescan_period: 5.0             # s between full-frame searches while every rover is being tracked
+  # roi: [0, 200, 1920, 1080]    # only search this part of the frame (x0, y0, x1, y1)
+
+# Floor reference tags: AprilTags (36h11) taped FLAT ON THE FLOOR at measured
+# positions. They are how the system knows where the camera is, and while they
+# stay down, how it notices the camera has been bumped. Use at least 6, spread
+# over the whole floor including the far side and the middle. Ids must differ
+# from the rovers'. x, y in metres in the arena frame (z defaults to 0 = floor).
+#
+# THESE ARE EXAMPLE POSITIONS for the default 4.2 x 3.2 m floor, placed clear
+# of the default route. Tape yours where convenient and type in what you MEASURE.
+# After calibrating you may lift any that are in the rovers' way; keep two or
+# three at the edges for the bumped-camera alarm.
+anchors:
+  - {id: 100, x: 0.30, y: 0.30}
+  - {id: 101, x: 2.10, y: 0.30}
+  - {id: 102, x: 3.90, y: 0.30}
+  - {id: 103, x: 3.90, y: 2.90}
+  - {id: 104, x: 2.10, y: 2.95}
+  - {id: 105, x: 0.30, y: 1.20}
+  - {id: 106, x: 2.40, y: 1.85}
+anchor_alarm_m: 0.03             # warn when the reference tags appear this far from where they should be

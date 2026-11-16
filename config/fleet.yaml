@@ -1,0 +1,48 @@
+# The rovers. The first one listed is the leader; the order is also the rank
+# (who brakes for whom).
+#
+# HOW COMMANDS REACH A ROVER  (the one thing here you must get right)
+#
+#   domain_id + cmd_topic: /cmd_vel
+#       The course set-up: every rover on its own ROS_DOMAIN_ID (the last
+#       number of its IP address), listening on /cmd_vel. Nothing changes on
+#       the rover. The planner opens one extra DDS participant per rover
+#       domain and publishes there.
+#
+#   domain_id: null + cmd_topic: /rover1/auto/cmd_vel   (or any namespaced topic)
+#       The Faux-GPS paper's contract: rovers share the planner's domain and
+#       something on each rover turns its namespaced intent into motion.
+#
+# Whichever you use,  ros2 run swarm_cps doctor  tells you per rover whether
+# anything is listening.
+
+robots:
+  - {name: rover1, tag_id: 1, domain_id: 1, cmd_topic: /cmd_vel, yaw_offset_deg: 0}
+  - {name: rover2, tag_id: 2, domain_id: 2, cmd_topic: /cmd_vel, yaw_offset_deg: 0}
+  - {name: rover3, tag_id: 3, domain_id: 3, cmd_topic: /cmd_vel, yaw_offset_deg: 0}
+  # per-rover extras, all optional:
+  #   tag_height: 0.125        this rover's tag is at a different height
+  #   tag_offset: [-0.04, 0]   reference point relative to the tag centre (forward, left) in metres
+  #   v_scale: 1.10            this rover drives 10 % slow: multiply its speed commands by 1.10
+  #   w_scale: 1.00            same for yaw rate (set -1.0 if it turns the wrong way)
+
+bridge: context        # context: extra DDS participants inside the planner (default)
+                       # relay:   one small process per rover (launch file starts them); use if
+                       #          "context" shows no subscribers in doctor
+relay_port_base: 47600
+
+tags:
+  size: 0.150          # edge of the black square, metres. MEASURE THE PRINTOUT.
+  height: 0.120        # top of the rover's tag above the floor, metres. MEASURE IT.
+
+# Control numbers. Anything left out keeps the default in swarm_cps/core/controller.py.
+control:
+  body_radius: 0.14          # MentorPi A1 is 213 x 159 mm
+  min_turn_radius: 0.35      # the course's figure; measure it (runbook, "First drive")
+  v_max: 0.22
+  w_max: 1.0
+  speed_range: [0.08, 0.18]
+  speed_default: 0.13
+  spacing: 0.45              # slot spacing; keep it above `protected` (Part I's spacing condition)
+  protected: 0.38
+  stale_timeout: 0.5
