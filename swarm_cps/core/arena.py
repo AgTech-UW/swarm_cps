@@ -70,6 +70,14 @@ class Arena:
             self.legs.append(dict(name=str(lg['name']), to=(float(t[0]), float(t[1]), math.radians(float(t[2]))),
                                   work=bool(lg.get('work', False))))
         self.lead_in = float(m.get('lead_in', 3.0))
+        self.solo = []                                        # rovers that drive a route of their own
+        for sd in m.get('solo') or []:
+            st2 = sd['start']
+            self.solo.append(dict(robot=str(sd.get('robot', 'last')),
+                                  start=(float(st2[0]), float(st2[1]), math.radians(float(st2[2]))),
+                                  legs=[dict(name=str(lg.get('name', 'solo')), work=False,
+                                             to=(float(lg['to'][0]), float(lg['to'][1]), math.radians(float(lg['to'][2]))))
+                                        for lg in sd['legs']]))
         self.offset_ramp = float(m.get('offset_ramp', 0.6))
 
     @classmethod
@@ -77,6 +85,9 @@ class Arena:
         import yaml
         with open(path) as f:
             return cls(yaml.safe_load(f))
+
+    def make_solo_route(self, sd):
+        return Route.from_poses(sd['start'], sd['legs'], self.turn_radius, ds=0.02, lead_in=0.6, run_out=1.0)
 
     def make_route(self):
         return Route.from_poses(self.start, self.legs, self.turn_radius, ds=0.02, lead_in=self.lead_in,
@@ -169,6 +180,12 @@ class Arena:
         ok, why = self.points_free(pts, body_radius + 0.05)
         if not ok:
             out.append('the leader\'s route %s (with %.2f m clearance)' % (why, body_radius + 0.05))
+        for sd in self.solo:
+            r2 = self.make_solo_route(sd)
+            pts2, _ = r2.lane_samples(0.0, 0.0, r2.length, 0.05)
+            ok2, why2 = self.points_free(pts2, body_radius + 0.05)
+            if not ok2:
+                out.append('the solo route of %s %s' % (sd['robot'], why2))
         if self.turn_radius < min_turn_radius:
             out.append('mission.turn_radius %.2f m is tighter than the rover can turn (%.2f m)'
                        % (self.turn_radius, min_turn_radius))

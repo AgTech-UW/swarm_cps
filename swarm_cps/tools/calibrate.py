@@ -2,6 +2,10 @@
 
   calibrate floor      solve where the camera is from the floor reference tags
                        (camera.yaml "anchors") and write camera_pose.yaml
+  calibrate floor --auto --origin 100 --xaxis 101
+                       NOTHING MEASURED: throw the cards down anywhere. Card
+                       100 becomes the origin and +x points from it to card
+                       101. Only the printed tag size has to be right.
   calibrate floor --walk
                        no reference tags printed? carry ONE tag to each marked
                        spot instead; you are prompted spot by spot
@@ -21,7 +25,7 @@ import sys
 
 import numpy as np
 
-from ..core.calib import average_detections, calibrate_floor
+from ..core.calib import average_detections, calibrate_floor, calibrate_floor_auto
 from ..core.localize import wrap
 from ..core.tags import tag_floor_pose
 from .common import cv2, grab_detections, say, settings, verdict
@@ -45,6 +49,8 @@ def cmd_floor(args):
     cam = st.camera_model()
     if args.walk:
         return cmd_walk(args, st, cam)
+    if args.auto:
+        return cmd_auto(args, st, cam)
     anchors = st.anchors()
     if len(anchors) < 4:
         say('camera.yaml lists %d floor reference tags; at least 4 are needed, 6 or more recommended.' % len(anchors))
@@ -88,6 +94,50 @@ def cmd_floor(args):
         say('wrote %s' % st.save_floor_map(fm, rep))
         return 0
     say('NOT saved (grade bad). Fix the problems above, or use --force to save anyway.')
+    return 1
+
+
+def cmd_auto(args, st, cam):
+    """Cards thrown on the floor, nothing surveyed."""
+    size = args.size or float((st.fleet.get('tags') or {}).get('size', 0.15))
+    rovers = [r.tag_id for r in st.robot_tags()]
+    say('Reading %d frames. Floor cards are every tag except the rovers\' (%s); card size %.0f mm.'
+        % (args.frames, rovers, 1e3 * size))
+    frames, gray = grab_detections(st, args.frames, args.image, args.device)
+    mean = average_detections(frames)
+    say('tags seen: %s' % (sorted(mean) or 'none'))
+    try:
+        fm, anchors, rep = calibrate_floor_auto(cam, mean, size, origin=args.origin, xaxis=args.xaxis,
+                                                origin_at=tuple(args.origin_at), exclude=rovers)
+    except Exception as e:
+        say('CALIBRATION FAILED: %s' % e)
+        if gray is not None:
+            cv2.imwrite(args.out_image, gray)
+            say('saved what the camera sees to %s' % args.out_image)
+        return 1
+    m = fm.describe()
+    say('')
+    say('camera position (%.2f, %.2f, %.2f) m; looking %.0f deg below horizontal'
+        % (m['position'][0], m['position'][1], m['position'][2], m['pitch_down_deg']))
+    say('origin: card %d at (%.2f, %.2f).  +x: %s' % (rep['origin'], args.origin_at[0], args.origin_at[1],
+        'toward card %d' % rep['xaxis'] if rep['xaxis'] is not None else 'the origin card\'s left-to-right direction'))
+    say('cards found at:')
+    for i, a in sorted(anchors.items()):
+        say('  %4d  x = %6.3f  y = %6.3f' % (i, a['x'], a['y']))
+    say('fit: %.2f px on the corners; every card measures within %.1f %% of %.0f mm'
+        % (rep['reproj_rms_px'], 100 * rep['size_max_error'], 1e3 * size))
+    for p in rep['problems']:
+        say('  ! ' + p)
+    ok = rep['grade'] != 'bad'
+    verdict(ok, 'calibration grade: %s' % rep['grade'].upper())
+    say('CHECK IT WITH A TAPE: measure the distance between two cards that are far apart and compare with the')
+    say('positions above. That one measurement tests the whole calibration, scale included.')
+    if gray is not None:
+        say('picture with the 0.5 m floor grid drawn on it: %s' % _annotate(gray, st, fm, mean, args.out_image))
+    if ok or args.force:
+        say('wrote %s (the card positions are stored with it, for the bumped-camera alarm)' % st.save_floor_map(fm, rep, anchors))
+        return 0
+    say('NOT saved (grade bad). Fix the problems above, or use --force.')
     return 1
 
 
@@ -244,6 +294,12 @@ def main(argv=None):
     ap.add_argument('--out-image', dest='out_image', default='/tmp/swarm_calibration.jpg')
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--walk', action='store_true')
+    ap.add_argument('--auto', action='store_true', help='floor: cards thrown anywhere, nothing measured')
+    ap.add_argument('--origin', type=int, default=None, help='auto: id of the card that marks the origin (default: lowest id seen)')
+    ap.add_argument('--xaxis', type=int, default=None, help='auto: id of a card that lies in the +x direction from the origin card')
+    ap.add_argument('--origin-at', dest='origin_at', nargs=2, type=float, default=[0.0, 0.0], metavar=('X', 'Y'),
+                    help='auto: arena coordinates of the origin card (default 0 0)')
+    ap.add_argument('--size', type=float, default=None, help='auto: edge of the cards\' black square in metres (default: tags.size)')
     ap.add_argument('--tag', type=int, default=1, help='walk mode: id of the tag you carry')
     ap.add_argument('--height', type=float, default=0.0, help='walk mode: height of that tag above the floor (m)')
     ap.add_argument('--heading', type=float, default=0.0, help='yaw: direction the rovers are parked facing (deg)')

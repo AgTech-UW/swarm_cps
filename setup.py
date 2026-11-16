@@ -36,6 +36,7 @@ setup(
             'layout = swarm_cps.tools.layout:main',
             'simulate = swarm_cps.tools.simulate:main',
             'tag_sheet = swarm_cps.tools.tag_sheet:main',
+            'draw_path = swarm_cps.tools.draw_path:main',
         ],
     },
 )

@@ -293,7 +293,7 @@ class Planner(Node):
                     self.bridge.send(n, v * vs, w * ws)
         if self.ctl.armed and all(n in states for n in self.names):
             pos = {n: (states[n].x, states[n].y) for n in self.names}
-            working = [n for n in self.names if n in self.ctl.s and self.ctl.route.leg_at(self.ctl.s[n])['work']]
+            working = self.ctl.working_names()
             self.metrics.update(pos, min(dt, 0.5), working, list(self.ctl.stop_cause))
             if self.csv is not None and self.n_tick % 3 == 0:
                 self.write_row(states, cmds)

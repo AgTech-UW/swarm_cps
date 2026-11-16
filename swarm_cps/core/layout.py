@@ -99,6 +99,92 @@ def make_layout(width, height, n_rovers=3, spacing=0.45, turn_radius=0.55, body_
     return cfg, notes
 
 
+def make_simple_layout(width, height, n_rovers=3, spacing=0.45, turn_radius=0.55, body_radius=0.14,
+                       edge_margin=0.20, laps=2, rock=False):
+    """Stage 1 course: an empty floor and a racetrack. No wall, no gate, no
+    strip; a rock only if asked for. The crew starts in single file on the
+    south straight, drives `laps` laps anticlockwise and stops where it began.
+
+        y = H +----------------------------------------+
+              |   .----<----- north straight -----.    |
+              |   |                               |    |
+              |   '-->-- o o O --- south straight-'    |
+        y = 0 +----------------------------------------+
+
+    Returns (config, notes); raises ValueError if the floor is too small."""
+    W, H, R, d = float(width), float(height), float(turn_radius), float(spacing)
+    n = max(1, int(n_rovers))
+    col = (n - 1) * d
+    clear = edge_margin + body_radius + 0.05
+    if H < 2 * R + 2 * clear:
+        raise ValueError('floor is %.1f m wide; a loop with %.2f m turns needs %.1f m. Use a smaller turn_radius '
+                         '(not below the rover\'s own 0.35 m).' % (H, R, 2 * R + 2 * clear))
+    y1 = max(clear, H / 2 - R)
+    y2 = y1 + 2 * R
+    xw = edge_margin + R + 0.05                         # west end of the straights
+    xe = W - edge_margin - R - 0.05                     # east end
+    xs = max(edge_margin + col + 0.10, xw + 0.20)       # leader's start: room for the column behind it
+    if xe - xs < 0.6:
+        raise ValueError('floor is %.1f m long; %d rovers in single file plus two %.2f m turns need about %.1f m. '
+                         'Use fewer rovers or a smaller spacing.' % (W, n, R, xs + 0.6 + R + edge_margin + 0.05))
+
+    def r2(v):
+        return round(float(v), 2) + 0.0
+    legs = []
+    for k in range(1, max(1, int(laps)) + 1):
+        legs += [dict(name='lap %d south straight' % k, to=[r2(xe), r2(y1), 0], work=True),
+                 dict(name='lap %d east turn' % k, to=[r2(xe), r2(y2), 180]),
+                 dict(name='lap %d north straight' % k, to=[r2(xw), r2(y2), 180], work=True),
+                 dict(name='lap %d west turn' % k, to=[r2(xw), r2(y1), 0])]
+    legs.append(dict(name='finish', to=[r2(xs), r2(y1), 0]))
+    cfg = dict(bounds=dict(x=[0.0, r2(W)], y=[0.0, r2(H)]), edge_margin=edge_margin,
+               compass=dict(plus_x='east', plus_y='north'), walls=[], zones=[], obstacles=[],
+               mission=dict(turn_radius=R, swath=r2(min(0.30, d)), lead_in=r2(col + 1.0),
+                            start=[r2(xs), r2(y1), 0], legs=legs))
+    if rock:
+        cfg['obstacles'].append(dict(name='rock', x=r2(xw + 0.5 * (xe - xw)), y=r2(y2 + 0.05), r=0.10))
+    return cfg, []
+
+
+def make_duel_layout(width, height, n_rovers=2, kind='head-on', spacing=0.45, turn_radius=0.55, body_radius=0.14,
+                     edge_margin=0.20):
+    """Collision-course course: an empty floor, the crew driving east along the
+    middle, and the LAST rover in fleet.yaml on a route of its own that meets
+    them. kind = 'head-on' (same line, opposite directions) or 'crossing'
+    (from the south, timed to arrive at the crossing point together). With
+    two rovers it is one against one; with three, a column of two meets one.
+    Returns (config, notes)."""
+    W, H, d = float(width), float(height), float(spacing)
+    n = max(2, int(n_rovers))
+    col = (n - 2) * d                                   # followers behind the crew's leader
+    yc = H / 2
+    xs = edge_margin + col + 0.10
+    xe = W - edge_margin - 0.30
+    if xe - xs < 2.0:
+        raise ValueError('floor is %.1f m long; the rovers need about %.1f m to meet and get past each other'
+                         % (W, xs + 2.0 + edge_margin + 0.30))
+
+    def r2(v):
+        return round(float(v), 2) + 0.0
+    notes = []
+    if kind == 'crossing':
+        ys = edge_margin + 0.10
+        run = yc - ys                                   # solo's distance to the crossing point
+        xc = xs + run                                   # so the leader is the same distance from it
+        if xc > xe - 0.6 or H - edge_margin - 0.30 - yc < 0.5:
+            raise ValueError('floor is too small for a crossing; use --duel head-on')
+        solo = dict(robot='last', start=[r2(xc), r2(ys), 90], legs=[dict(name='crossing', to=[r2(xc), r2(H - edge_margin - 0.30), 90])])
+        notes.append('both rovers are %.2f m from the crossing point at the start, so at equal speed they arrive together' % run)
+    else:
+        solo = dict(robot='last', start=[r2(W - edge_margin - 0.10), r2(yc), 180], legs=[dict(name='head-on', to=[r2(edge_margin + 0.30), r2(yc), 180])])
+    cfg = dict(bounds=dict(x=[0.0, r2(W)], y=[0.0, r2(H)]), edge_margin=edge_margin,
+               compass=dict(plus_x='east', plus_y='north'), walls=[], zones=[], obstacles=[],
+               mission=dict(turn_radius=float(turn_radius), swath=r2(min(0.30, d)), lead_in=r2(col + 1.0),
+                            start=[r2(xs), r2(yc), 0], legs=[dict(name='run', to=[r2(xe), r2(yc), 0], work=True)],
+                            solo=[solo]))
+    return cfg, notes
+
+
 def dump_yaml(cfg, header=''):
     """arena.yaml text with the comments a person needs."""
     def pt(p):
@@ -113,14 +199,20 @@ def dump_yaml(cfg, header=''):
     L.append('walls:                                   # lines on the floor; the gap between two is the gate')
     for w in cfg['walls']:
         L.append('  - {name: %s, from: %s, to: %s}' % (w['name'], pt(w['from']), pt(w['to'])))
+    if not cfg['walls']:
+        L[-1] = 'walls: []'
     L.append('')
     L.append('obstacles:                               # free-standing things the reflex steers round')
     for o in cfg['obstacles']:
         L.append('  - {name: %s, x: %g, y: %g, r: %g}' % (o['name'], o['x'], o['y'], o['r']))
+    if not cfg['obstacles']:
+        L[-1] = 'obstacles: []                            # add {name: rock, x: , y: , r: 0.1} to try the reflex'
     L.append('')
     L.append('zones:                                   # named floor areas; time spent in each is scored')
     for z in cfg['zones']:
         L.append('  - {name: %s, x: %s, y: %s}' % (z['name'], pt(z['x']), pt(z['y'])))
+    if not cfg['zones']:
+        L[-1] = 'zones: []'
     m = cfg['mission']
     L += ['', 'mission:',
           '  turn_radius: %g                      # radius of the route\'s turns (the rover\'s own limit is 0.35)' % m['turn_radius'],
@@ -130,4 +222,12 @@ def dump_yaml(cfg, header=''):
           '  legs:']
     for lg in m['legs']:
         L.append('    - {name: %s, to: %s%s}' % (lg['name'], pt(lg['to']), ', work: true' if lg.get('work') else ''))
+    if m.get('solo'):
+        L.append('  solo:                                  # rovers that drive a route of their own ("last" = last in fleet.yaml)')
+        for sd in m['solo']:
+            L.append('    - robot: %s' % sd['robot'])
+            L.append('      start: %s' % pt(sd['start']))
+            L.append('      legs:')
+            for lg in sd['legs']:
+                L.append('        - {name: %s, to: %s}' % (lg['name'], pt(lg['to'])))
     return '\n'.join(L) + '\n'

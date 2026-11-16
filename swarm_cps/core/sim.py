@@ -226,8 +226,7 @@ def run_mission(arena, names, decider=None, instruction='', params=None, sim=Non
         world.command(cmds)
         world.step(dt)
         t += dt
-        working = [n for n in names if n in ctl.s and ctl.route.leg_at(ctl.s[n])['work']
-                   and 0.0 <= ctl.s[n] <= ctl.route.length]
+        working = ctl.working_names()
         stopped = [n for n in ctl.stop_cause] if ctl.armed else []
         met.update(world.truth(), dt, working, stopped)
         if on_step is not None:

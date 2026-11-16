@@ -82,6 +82,10 @@ class Settings:
     def anchors(self):
         """Floor reference tags: dict tag_id -> dict(x, y, z, [yaw, size])."""
         out = {}
+        if os.path.isfile(self.pose_path):                    # cards located by "calibrate floor --auto"
+            solved = _yaml(self.pose_path).get('anchors')
+            if solved:
+                return {int(a['id']): dict(x=float(a['x']), y=float(a['y']), z=float(a.get('z', 0.0))) for a in solved}
         for a in (self.camera.get('anchors') or []):
             d = dict(x=float(a['x']), y=float(a['y']), z=float(a.get('z', 0.0)))
             if a.get('yaw') is not None:
@@ -115,9 +119,11 @@ class Settings:
                              % (d.get('image_size'), list(camera.size)))
         return FloorMap.from_dict(camera, d)
 
-    def save_floor_map(self, fm, report=None):
+    def save_floor_map(self, fm, report=None, anchors=None):
         import yaml
         d = fm.to_dict()
+        if anchors:
+            d['anchors'] = [dict(id=int(i), x=round(float(a['x']), 4), y=round(float(a['y']), 4)) for i, a in sorted(anchors.items())]
         if report:
             d['report'] = {k: v for k, v in report.items() if k not in ('per_point_m',)}
         with open(self.pose_path, 'w') as f:

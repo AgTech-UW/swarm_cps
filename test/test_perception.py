@@ -9,7 +9,8 @@ import pytest
 cv2 = pytest.importorskip('cv2')
 
 from swarm_cps.core.camera import CameraModel, FloorMap, trilaterate
-from swarm_cps.core.calib import average_detections, calibrate_floor, coverage, score_coverage, best_aim
+from swarm_cps.core.calib import (average_detections, best_aim, calibrate_floor, calibrate_floor_auto, coverage,
+                                  score_coverage)
 from swarm_cps.core.localize import Localizer, PoseFilter, RobotTag, wrap
 from swarm_cps.core.synth import Scene
 from swarm_cps.core.tags import Detector, tag_floor_pose, tag_image
@@ -218,3 +219,44 @@ def test_mount_planner_prefers_a_sensible_aim(cam):
     # looking straight down from the corner sees much less of the floor
     down = FloorMap.from_mount(cam, CAM_POS, (CAM_POS[0] + 0.01, CAM_POS[1] + 0.01, 0.0))
     assert score_coverage(coverage(down, ROOM, step=0.4))['visible_fraction'] < sc['visible_fraction']
+
+
+def test_calibration_from_cards_thrown_on_the_floor(cam):
+    """Nothing is surveyed. Nine cards lie at random; card 100 is declared the
+    origin and card 101 the +x direction. The solved camera pose must then
+    locate rovers (at tag height) as well as the surveyed calibration does."""
+    if not have_apriltag():
+        pytest.skip('pupil_apriltags not installed')
+    rng = np.random.default_rng(7)
+    fm_true = FloorMap.from_mount(cam, (2.1, -0.2, 2.4), (2.3, 1.1, 0.0))
+    sc = Scene(fm_true, seed=7)
+    cards = {100: (0.3, 0.3), 101: (3.6, 0.3)}
+    for i in range(102, 109):
+        cards[i] = (rng.uniform(0.4, 3.6), rng.uniform(0.5, 2.8))
+    for i, (x, y) in cards.items():
+        sc.add_tag(i, x, y, rng.uniform(-3.1, 3.1), z=0.0)
+    rovers = {1: (1.0, 1.5, 0.4), 2: (2.9, 2.2, -2.0), 3: (2.2, 0.9, 2.5)}
+    for i, (x, y, yaw) in rovers.items():
+        sc.add_tag(i, x, y, yaw, z=0.12)
+    found = {d.id: d for d in Detector('apriltag', threads=2).detect(sc.render())}
+    mean = average_detections([found])
+    fm, anchors, rep = calibrate_floor_auto(cam, mean, 0.15, origin=100, xaxis=101, origin_at=(0.3, 0.3), exclude=(1, 2, 3))
+    assert rep['grade'] == 'good', rep
+    assert np.linalg.norm(fm.center - fm_true.center) < 0.02
+    assert len(anchors) >= 7
+    for i, a in anchors.items():
+        assert math.hypot(a['x'] - cards[i][0], a['y'] - cards[i][1]) < 0.015
+    for i, (x, y, yaw) in rovers.items():
+        p = tag_floor_pose(found[i], fm, 0.12, 0.15)
+        assert math.hypot(p['x'] - x, p['y'] - y) < 0.012 and abs(wrap(p['yaw'] - yaw)) < math.radians(2.5)
+    # a wrong card size is a wrong scale, and nothing in the picture can reveal it: the result is
+    # self-consistent but 10 % small, which is why the tool tells you to check one distance with a tape
+    fm2, anchors2, rep2 = calibrate_floor_auto(cam, mean, 0.135, origin=100, xaxis=101, origin_at=(0.3, 0.3), exclude=(1, 2, 3))
+    d_true = math.hypot(cards[101][0] - cards[100][0], cards[101][1] - cards[100][1])
+    d_meas = math.hypot(anchors2[101]['x'] - anchors2[100]['x'], anchors2[101]['y'] - anchors2[100]['y'])
+    assert abs(d_meas / d_true - 0.9) < 0.01
+    # too few cards, or the origin card missing, is refused in words
+    with pytest.raises(ValueError):
+        calibrate_floor_auto(cam, {i: mean[i] for i in (100, 101, 102)}, 0.15)
+    with pytest.raises(ValueError):
+        calibrate_floor_auto(cam, mean, 0.15, origin=555)

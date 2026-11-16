@@ -1,6 +1,7 @@
 """The crew controller, the safety layers and the deciders, run against the
 simulated rovers (actuator lag, turning limit, noisy late camera)."""
 import math
+import os
 
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ from swarm_cps.core.arena import Arena
 from swarm_cps.core.controller import Params, RobotState, SwarmController, limit_command
 from swarm_cps.core.deciders import FixedColumn, Rule, Schedule
 from swarm_cps.core.foreman import Foreman, MockModel, build_system, parse_json
-from swarm_cps.core.layout import make_layout
+from swarm_cps.core.layout import make_duel_layout, make_layout, make_simple_layout
 from swarm_cps.core.path import Route, _integrate, dubins_shortest, wrap
 from swarm_cps.core.sim import SimWorld, run_mission
 
@@ -325,3 +326,127 @@ def test_layout_refuses_a_floor_that_is_too_small():
 
 def test_route_is_a_route():
     assert isinstance(arena().make_route(), Route)
+
+
+# ---------------------------------------------------------------- stage 1: just follow the leader
+@pytest.mark.parametrize('floor', [(3.6, 2.4, 2), (4.2, 3.2, 3), (5.5, 3.5, 4)])
+def test_stage_one_loop_in_single_file(floor):
+    """Empty floor, a racetrack, no decider at all: the leader follows the
+    route with the vector field, the others follow it and keep their distance."""
+    w, h, n = floor
+    ar = Arena(make_simple_layout(w, h, n, laps=2)[0])
+    names = ['rover%d' % (i + 1) for i in range(n)]
+    gaps = []
+
+    def watch(t, world, ctl, met):
+        if t > 8.0 and not ctl.done:
+            gaps.extend(math.hypot(world.state[a][0] - world.state[b][0], world.state[a][1] - world.state[b][1])
+                        for a, b in zip(names, names[1:]))
+    out = run_mission(ar, names, None, on_step=watch, t_max=400)
+    r = out['result']
+    assert r['completed'] and r['collisions'] == 0, r
+    assert r['min_clearance_m'] > 0.05
+    assert out['controller'].formation == 'column'
+    # neighbours stay about one slot spacing apart the whole way round (chords are shorter in the turns)
+    assert 0.30 < min(gaps) and max(gaps) < 0.62, (min(gaps), max(gaps))
+    # and they end where they started, lined up
+    x0, y0, _ = out['controller'].start_poses()[names[0]]
+    assert math.hypot(out['world'].state[names[0]][0] - x0, out['world'].state[names[0]][1] - y0) < 0.08
+
+
+def test_stage_one_with_a_rock_and_a_stalled_rover():
+    ar = Arena(make_simple_layout(4.2, 3.2, 3, laps=1, rock=True)[0])
+    out = run_mission(ar, NAMES, None)
+    assert out['result']['completed'] and out['result']['collisions'] == 0, out['result']
+    # one rover's motors cut out for six seconds mid-lap: the one behind waits, nobody touches, the run finishes
+    out = run_mission(ar, NAMES, None, t_max=400, events=[(15.0, lambda w, c: w.frozen.add('rover2')),
+                                                          (21.0, lambda w, c: w.frozen.discard('rover2'))])
+    assert out['result']['completed'] and out['result']['collisions'] == 0, out['result']
+
+
+# ---------------------------------------------------------------- collision course
+def _duel(kind, n=2, floor=(4.2, 3.2), **kw):
+    ar = Arena(make_duel_layout(floor[0], floor[1], n, kind)[0])
+    names = ['rover%d' % (i + 1) for i in range(n)]
+    track = {m: [] for m in names}
+
+    def watch(t, world, ctl, met):
+        for m in names:
+            track[m].append((world.state[m][0], world.state[m][1]))
+    out = run_mission(ar, names, None, on_step=watch, t_max=120, **kw)
+    return ar, out, {m: np.array(v) for m, v in track.items()}
+
+
+def test_two_rovers_head_on_both_keep_right_and_pass():
+    ar, out, tr = _duel('head-on')
+    r = out['result']
+    assert r['completed'] and r['collisions'] == 0, r
+    assert r['min_clearance_m'] > 0.05 and r['stopped_machine_seconds'] == 0.0     # they flowed past; nobody had to stop
+    yc = ar.start[1]
+    assert tr['rover1'][:, 1].min() < yc - 0.12       # east-bound: its right is south
+    assert tr['rover2'][:, 1].max() > yc + 0.12       # west-bound: its right is north
+    assert tr['rover1'][:, 1].max() < yc + 0.05 and tr['rover2'][:, 1].min() > yc - 0.05   # neither went left
+    # and both came back to the line and finished on their marks
+    assert abs(tr['rover1'][-1, 1] - yc) < 0.05 and abs(tr['rover2'][-1, 1] - yc) < 0.05
+
+
+def test_crossing_the_one_with_the_other_on_its_right_gives_way():
+    ar, out, tr = _duel('crossing')
+    r = out['result']
+    assert r['completed'] and r['collisions'] == 0, r
+    xc = ar.solo[0]['start'][0]
+    assert np.abs(tr['rover2'][:, 0] - xc).max() < 0.05                 # the stand-on rover held its course
+    assert tr['rover1'][:, 1].min() < ar.start[1] - 0.15                # the give-way rover went behind it
+
+
+@pytest.mark.parametrize('case', [('head-on', 3, (4.2, 3.2)), ('crossing', 3, (4.2, 3.2)), ('head-on', 4, (5.5, 3.5))])
+def test_a_column_meets_a_lone_rover(case):
+    kind, n, floor = case
+    ar, out, tr = _duel(kind, n, floor)
+    assert out['result']['completed'] and out['result']['collisions'] == 0, out['result']
+    assert out['controller'].followers == ['rover%d' % (i + 1) for i in range(1, n - 1)]
+
+
+def test_collision_course_without_the_passing_rule_ends_in_a_safe_standoff():
+    """Turn the right-of-way rule off and the last-resort stop is all that is
+    left: the rovers stop nose to nose, untouched, and the run does not finish."""
+    for kind in ('head-on', 'crossing'):
+        ar, out, tr = _duel(kind, params=Params(avoid_look=0.0))
+        assert out['result']['collisions'] == 0, (kind, out['result'])
+        assert not out['result']['completed']
+
+
+def test_collision_course_with_sloppy_hardware():
+    ar = Arena(make_duel_layout(4.2, 3.2, 2, 'head-on')[0])
+    names = ['rover1', 'rover2']
+    for seed in range(4):
+        ctl = SwarmController(ar, names)
+        world = SimWorld(names, ctl.start_poses(), true_turn_radius=0.45, tau_v=0.4, tau_w=0.35, pos_noise=0.01,
+                         yaw_noise=math.radians(2.5), latency=0.18, dropout=0.10, v_scale={'rover2': 0.8}, seed=seed)
+        out = run_mission(ar, names, None, sim=world, t_max=120)
+        assert out['result']['collisions'] == 0 and out['result']['completed'], (seed, out['result'])
+
+
+# ---------------------------------------------------------------- a route you draw yourself
+def test_a_drawn_route_is_driven(tmp_path, monkeypatch):
+    import shutil
+    from swarm_cps.settings import Settings
+    from swarm_cps.tools import draw_path
+    cfg = tmp_path / 'cfg'
+    shutil.copytree(os.path.join(os.path.dirname(__file__), '..', 'config'), str(cfg))
+    monkeypatch.setenv('SWARM_CONFIG_DIR', str(cfg))
+    import yaml
+    a = yaml.safe_load(open(str(cfg / 'arena.yaml')))
+    a['walls'], a['obstacles'], a['zones'] = [], [], []              # an empty floor to draw on
+    yaml.safe_dump(a, open(str(cfg / 'arena.yaml'), 'w'))
+    assert draw_path.main(['--points', '1.2,0.8', '3.2,0.8', '3.4,2.2', '1.4,2.4']) == 0     # an S across the floor
+    st = Settings()
+    out = run_mission(st.arena(), st.names, None, params=st.params())
+    assert out['result']['completed'] and out['result']['collisions'] == 0, out['result']
+    x, y = out['world'].state['rover1'][:2]
+    assert math.hypot(x - 1.4, y - 2.4) < 0.08                       # the leader stopped on the last point
+    # points off the floor, or too close to turn between, are refused and nothing is written
+    before = open(str(cfg / 'arena.yaml')).read()
+    assert draw_path.main(['--points', '1.2,0.8', '5.5,0.8']) == 1
+    assert draw_path.main(['--points', '1.5,1.0', '2.4,1.0', '1.5,1.2']) == 1
+    assert open(str(cfg / 'arena.yaml')).read() == before

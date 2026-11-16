@@ -13,7 +13,7 @@ camera --USB--> perception  --/roverN/gps/pose, /roverN/gps/vel-->  planner  --/
 
 ## Read this first: what has been run and what has not
 
-**Run, and passing (60 automated tests, in Python 3.10 / NumPy 1.21 / OpenCV 4.5.4, the versions in the Humble container):**
+**Run, and passing (73 automated tests, in Python 3.10 / NumPy 1.21 / OpenCV 4.5.4, the versions in the Humble container):**
 
 - Perception end to end on rendered frames that use your real lens calibration
   (`default_cam.yaml`) and a camera looking across the floor from a corner:
@@ -91,6 +91,76 @@ If `colcon build` gives trouble, everything also runs without it:
 4. **Print tags.** `ros2 run swarm_cps tag_sheet --ids 1 2 3 --size 0.15` and
    `--ids 100 101 102 103 104 105 106` for the floor. Measure the black square
    on paper and put that number in `fleet.yaml` (`tags.size`).
+
+## Two stages
+
+**Stage 1: swarm dynamics only, no language model.** The leader follows a route
+with the vector field. Each follower drives the same vector field along a line
+through its own slot behind the leader and uses its speed to hold its place.
+Boid separation pushes any two rovers apart inside 0.38 m, a rover brakes for a
+higher-ranked one ahead of it, the leader slows when the crew falls behind, and
+any rover stops rather than drive into another. This is the planner's default
+(`decider:=column`); nothing needs switching off. Give it a plain course:
+
+```bash
+ros2 run swarm_cps layout --width 4.2 --height 3.2 --rovers 3 --simple --laps 2 --write
+ros2 run swarm_cps simulate --check
+ros2 run swarm_cps simulate --decider column --gif /tmp/stage1.gif
+ros2 launch swarm_cps swarm.launch.py              # on the floor; then console: go
+```
+That is an empty floor and a racetrack: no gate, no strip. Things to show on it:
+put the rovers down crooked and off their marks and watch them form up; add
+`--rock` to the layout line and watch each one swerve round it and rejoin;
+`decider:=schedule` opens the line abreast on the straights and folds it for
+the turns, still with no model. In simulation the three-rover loop finishes two
+laps with no contact and neighbours between 0.30 and 0.62 m apart all the way round.
+
+**Stage 2: the foreman.** Same planner, same safety layers, plus the course with
+the gate and the strip (`layout` without `--simple`) and `decider:=foreman`.
+Everything from Gate 7 on. Stage 1 working on the floor is the precondition.
+
+`layout --write` keeps the previous course as `arena.yaml.bak`, so switching
+between the two courses is one command each way.
+
+## The short version: camera up, cards down, rovers moving
+
+```bash
+ros2 run swarm_cps cam_bench                                    # camera link ok?
+ros2 run swarm_cps calibrate floor --auto --origin 100 --xaxis 101
+ros2 run swarm_cps calibrate yaw --heading 0 --write            # rovers parked facing +x
+ros2 run swarm_cps layout --width W --height H --rovers 2 --duel head-on --write
+ros2 launch swarm_cps swarm.launch.py                           # then console: go
+```
+**Cards, nothing measured.** Throw 6 or more floor cards anywhere in view, flat,
+spread out, some at the far side. Card 100 becomes the origin (0, 0) and +x
+points from it toward card 101, so put those two where you want the corner and
+the long edge, 2 m or more apart. W and H are then how far the usable floor
+extends from card 100. The only number that must be right is the printed tag
+size (`tags.size`): it sets the scale. Afterwards tape-measure the distance
+between two far-apart cards and compare with the positions it printed; that
+one measurement checks everything. On rendered frames this lands within 3 mm.
+
+**Lens distortion** is handled. Every tag corner is run backwards through your
+lens calibration before any geometry, so the bent image becomes straight rays.
+Straight tape lines look curved in the picture; the 0.5 m grid the tool draws in
+`/tmp/swarm_calibration.jpg` curves the same way and should lie on the floor.
+If it peels away from the floor near the image edges, the lens calibration is
+weak there: keep the working area away from the edges or redo the checkerboard.
+
+**Collision course.** `--duel head-on` sends the last rover in `fleet.yaml`
+straight at the others; `--duel crossing` brings it in from the side, timed to
+arrive together. They use boat rules: head-on, both turn right; crossing, the
+one with the other on its right goes behind it. With 3 rovers a column of two
+meets one. In simulation every case passes with no contact, and with the rule
+switched off they stop nose to nose instead of touching.
+
+**Your own route.** `ros2 run swarm_cps draw_path` opens a top-down view of
+your floor: click waypoints, `s` to save. The grey line is what will be driven
+(waypoints joined by curves the rovers can make); the leader follows it and the
+rest keep formation behind. Without a window: `draw_path --points 1.2,0.8 3.2,0.8 3.4,2.2`.
+It refuses routes that leave the floor or loop back on themselves. Run
+`simulate --check` afterwards. The window itself is the one part of this tool
+I could not run here (no display); the typed-points path is tested.
 
 ## Wednesday: seven gates, in order
 
@@ -182,11 +252,12 @@ Check one rover's response: `ros2 topic echo /rover1/gps/vel` shows measured
 speed and yaw rate next to what was commanded on `/rover1/auto/cmd_vel`. If a
 rover runs slow or turns the wrong way, set `v_scale` / `w_scale` for it.
 
-### Gate 6. First drive: single file (15 min)
+### Gate 6. First drive: single file (15 min). This is Stage 1.
 
-Rovers on their start marks (the planner prints them; `simulate --check` too).
+Use the `--simple` course first. Rovers on their start marks (the planner prints them; `simulate --check` too).
 `ros2 launch swarm_cps swarm.launch.py`, then `console`: `go`.
-**Pass:** the column goes through the gate, round the rock, round the headland and stops. Enter stops it at any time.
+**Pass:** the column drives its laps nose to tail and stops where it started (on the full course: through the gate,
+round the rock, round the headland). Enter stops it at any time.
 If the turns run wide, the real turning radius is above 0.35 m: raise `min_turn_radius` and `mission.turn_radius`
 together and re-run `simulate --check`.
 
@@ -319,5 +390,5 @@ swarm_cps/tools/     calibrate, cam_bench, plan_mount, layout, simulate, tag_she
 config/              arena.yaml, fleet.yaml, camera.yaml, default_cam.yaml  (camera_pose.yaml is written by calibrate)
 launch/              swarm.launch.py (real), rehearse.launch.py (simulated rovers)
 scripts/             setup_container.sh, preflight.sh
-test/                60 tests: python3 -m pytest swarm_cps/test -q   (about a minute; needs no ROS)
+test/                73 tests: python3 -m pytest swarm_cps/test -q   (about a minute; needs no ROS)
 ```

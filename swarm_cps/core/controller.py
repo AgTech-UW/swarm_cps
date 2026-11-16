@@ -53,6 +53,8 @@ class Params:
     stop_gap = 0.06             # m, body-to-body gap that stops any machine driving at another
     reflex_look = 1.0           # m, how far ahead the reflex reacts
     reflex_margin = 0.12        # m, clearance the reflex keeps
+    avoid_look = 1.3            # m, how far away a rover on another route is reacted to
+    avoid_margin = 0.10         # m, clearance kept when passing a rover on another route
     stale_timeout = 0.5         # s, oldest pose the controller will act on
     leader_wait = (0.30, 0.90, 0.30)   # m lag where the leader starts to slow, m where it is slowest, floor
     slot_rate = 0.12            # m/s, how fast a slot moves to its new place on a formation change
@@ -108,9 +110,17 @@ class SwarmController:
             raise ValueError('need at least a leader')
         self.names = names
         self.leader = names[0]
-        self.followers = names[1:]
-        self.n = len(self.followers)
         self.route = arena.make_route()
+        # Rovers with a route of their own (arena.yaml mission.solo). They are not
+        # in the formation; the crew and they keep clear of each other.
+        self.solo = {}
+        for sd in arena.solo:
+            nm = names[-1] if sd['robot'] == 'last' else sd['robot']
+            if nm in names[1:] and nm not in self.solo:
+                self.solo[nm] = arena.make_solo_route(sd)
+        self.followers = [n for n in names[1:] if n not in self.solo]
+        self.n = len(self.followers)
+        self.crew = [self.leader] + self.followers
         if self.p.k_cross is None:
             self.k_cross = 2.5 / arena.turn_radius
         else:
@@ -139,6 +149,8 @@ class SwarmController:
         self.s = {}                                          # progress along the route per rover
         self.s_leader = 0.0
         self.side = {}                                       # (rover, obstacle index) -> +1 / -1
+        self.avoid = {}                                      # (rover, other rover) -> 'pass' | 'giveway' | 'stand'
+        self.hold = set()                                    # (rover, other rover): stopped for it, with hysteresis
         self.wanted = None                                   # a decision the safety filter is holding
         self.log = []                                        # decisions, holds, releases
         self.stop_cause = {}
@@ -576,6 +588,79 @@ class SwarmController:
             v = v * (1.0 - 0.5 * wgt)
         return chi, v, active
 
+    def _group(self, name):
+        return 'crew' if name in self.crew else name
+
+    def _avoid_rovers(self, name, st, chi, v, states):
+        """Keep clear of rovers that are on another route, by the rules boats
+        use, because they need no negotiation and both sides can apply them
+        at once:
+
+          meeting head-on        both turn right and pass left side to left side
+          crossing, it is on my right    I give way: turn right (behind it) and slow
+          crossing, it is on my left     I hold my course and speed
+
+        A rule is chosen once per encounter and kept until the other rover is
+        behind or out of range, so the pair cannot dither. Nothing is done
+        unless the two would actually come too close on their present courses.
+        Returns (course, speed, active)."""
+        p = self.p
+        active = False
+        clear = 2 * p.body_radius + p.avoid_margin
+        for other in self.names:
+            if other == name or self._group(other) == self._group(name) or other not in states:
+                continue
+            so = states[other]
+            dx, dy = so.x - st.x, so.y - st.y
+            d = max(math.hypot(dx, dy), 1e-6)
+            key = (name, other)
+            b = math.atan2(dy, dx)
+            beta = wrap(b - st.yaw)
+            if d > p.avoid_look or abs(beta) > math.radians(100.0):
+                self.avoid.pop(key, None)                     # out of range or behind: encounter over
+                continue
+            mode = self.avoid.get(key)
+            if mode is None:
+                # would we come too close? closest approach on present courses
+                vx = v * math.cos(chi) - so.v * math.cos(so.yaw)
+                vy = v * math.sin(chi) - so.v * math.sin(so.yaw)
+                v2 = vx * vx + vy * vy
+                if v2 < 1e-6:
+                    continue
+                t = (dx * vx + dy * vy) / v2
+                if t <= 0:
+                    continue
+                miss = math.hypot(dx - vx * t, dy - vy * t)
+                if miss > clear + 0.10:
+                    continue
+                rel = abs(wrap(so.yaw - st.yaw))
+                moving = so.v > 0.03
+                if moving and rel < math.radians(135.0) and beta < -math.radians(10.0):
+                    mode = 'giveway'
+                elif moving and rel < math.radians(135.0) and beta > math.radians(10.0):
+                    mode = 'stand'
+                else:
+                    mode = 'pass'                             # head-on, dead ahead, or parked in my way
+                self.avoid[key] = mode
+            if mode == 'stand':
+                continue
+            half = math.asin(min(1.0, clear / d))
+            if wrap(chi - b) > -half:                         # wanted course is not yet right of it
+                chi = b - half
+                active = True
+            if mode == 'giveway':
+                v = v * max(0.35, min(1.0, (d - 0.45) / 0.45))
+                active = True
+        return chi, v, active
+
+    def working_names(self):
+        """Crew members that are on a working leg right now (for the coverage score)."""
+        out = []
+        for n in self.crew:
+            if n in self.s and 0.0 <= self.s[n] <= self.route.length and self.route.leg_at(self.s[n])['work']:
+                out.append(n)
+        return out
+
     def _crowding(self, name, st, states):
         left = right = 0.0
         for other, so in states.items():
@@ -677,7 +762,8 @@ class SwarmController:
             # slow for the last few centimetres so the stop is on the mark
             v = min(v, max(0.04, 1.5 * (r.length - self.s_leader)))
             chi, v, act = self._reflex(self.leader, lead, chi, v, states)
-            w = p.k_heading * wrap(chi - lead.yaw) + (0.0 if act else v * kap)
+            chi, v, act2 = self._avoid_rovers(self.leader, lead, chi, v, states)
+            w = p.k_heading * wrap(chi - lead.yaw) + (0.0 if (act or act2) else v * kap)
             cmds[self.leader] = (v, w)
             self._leader_cmd_v = v
 
@@ -736,10 +822,11 @@ class SwarmController:
             if v_des <= 1e-6 and (px or py):
                 v = min(v, 0.06)                              # nudged while parked: creep, don't lunge
             chi_c, v, act = self._reflex(name, st, chi_c, v, states)
-            w = p.k_heading * wrap(chi_c - st.yaw) + (0.0 if act else v * kf / den)
+            chi_c, v, act2 = self._avoid_rovers(name, st, chi_c, v, states)
+            w = p.k_heading * wrap(chi_c - st.yaw) + (0.0 if (act or act2) else v * kf / den)
             # ranked braking: slow for any higher-ranked machine ahead and close
             g = 1.0
-            for other in self.names[:i + 1]:
+            for other in self.crew[:i + 1]:
                 so = states[other]
                 dx, dy = so.x - st.x, so.y - st.y
                 d = math.hypot(dx, dy)
@@ -751,6 +838,26 @@ class SwarmController:
                     self.stop_cause[name] = 'braking for a machine ahead'
             cmds[name] = (v, w)
         self._lag = lag
+
+        # ---- rovers on a route of their own ----
+        solo_done = True
+        for name, route in self.solo.items():
+            st = states[name]
+            if name not in self.s:
+                self.s[name], _ = route.project(st.x, st.y, 0.0, back=0.5, ahead=1.5)
+            ss, es = route.project(st.x, st.y, self.s[name])
+            self.s[name] = max(self.s[name], ss)
+            if self.s[name] >= route.length - p.goal_tolerance:
+                cmds[name] = (0.0, 0.0)
+                continue
+            solo_done = False
+            _, _, ths, ks = route.at(self.s[name])
+            chi = ths - p.chi_inf_leader * (2 / math.pi) * math.atan(self.k_cross * es)
+            v = min(self.speed, max(0.04, 1.5 * (route.length - self.s[name])))
+            chi, v, act = self._reflex(name, st, chi, v, states)
+            chi, v, act2 = self._avoid_rovers(name, st, chi, v, states)
+            w = p.k_heading * wrap(chi - st.yaw) + (0.0 if (act or act2) else v * ks)
+            cmds[name] = (v, w)
 
         # ---- stops that apply to one machine ----
         for name in self.names:
@@ -765,7 +872,20 @@ class SwarmController:
                 so = states[other]
                 dx, dy = so.x - st.x, so.y - st.y
                 d = math.hypot(dx, dy)
-                if d - 2 * p.body_radius < p.stop_gap and (dx * hx + dy * hy) / max(d, 1e-6) > math.cos(math.radians(50.0)):
+                # the faster the two are closing, the earlier the stop (half a second of closing distance)
+                ux, uy = dx / max(d, 1e-6), dy / max(d, 1e-6)
+                closing = max(0.0, st.v * (hx * ux + hy * uy) - so.v * (math.cos(so.yaw) * ux + math.sin(so.yaw) * uy))
+                ahead = (dx * hx + dy * hy) / max(d, 1e-6)
+                gap = d - 2 * p.body_radius
+                key = (name, other)
+                if key in self.hold:
+                    # once stopped for a rover, stay stopped until it is clearly out of the way; a
+                    # stop that flickers with measurement noise lets the rover creep into contact
+                    if gap > p.stop_gap + 0.08 or ahead < math.cos(math.radians(80.0)):
+                        self.hold.discard(key)
+                elif gap < p.stop_gap + 0.5 * closing and ahead > math.cos(math.radians(50.0)):
+                    self.hold.add(key)
+                if key in self.hold:
                     cmds[name] = (0.0, 0.0)
                     self.stop_cause[name] = 'stopped: %s is in the way' % other
             dw, wall = self.arena.nearest_wall(st.x, st.y)
@@ -791,7 +911,8 @@ class SwarmController:
         if leader_done and all(out[n][0] == 0.0 for n in self.names):
             settled = all((self.s[n] - (self.s_leader + self.slots_now[i][0])) > -3 * p.goal_tolerance or
                           n in self.stop_cause for i, n in enumerate(self.followers))
-            if settled:
+            if settled and (solo_done or all(n in self.stop_cause for n in self.solo
+                                             if self.s[n] < self.solo[n].length - p.goal_tolerance)):
                 self.done = True
                 self.armed = False
         self._fill_status(states, out, slot_err)
@@ -818,6 +939,9 @@ class SwarmController:
         out[self.leader] = (x, y, th)
         for i, name in enumerate(self.followers):
             x, y, th, _ = self.route.at(-(i + 1) * self.p.spacing)
+            out[name] = (x, y, th)
+        for name, route in self.solo.items():
+            x, y, th, _ = route.at(0.0)
             out[name] = (x, y, th)
         return out
 

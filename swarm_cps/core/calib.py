@@ -111,6 +111,168 @@ def calibrate_floor(camera, mean_corners, anchors):
 
 
 # --------------------------------------------------------------------------
+#  Calibration from cards thrown on the floor (nothing measured but the tag size)
+# --------------------------------------------------------------------------
+
+def _rodrigues(rv):
+    th = float(np.linalg.norm(rv))
+    if th < 1e-12:
+        return np.eye(3)
+    k = rv / th
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * K @ K
+
+
+def _square(x, y, yaw, size):
+    """Floor corners (tl, tr, br, bl) of a flat tag whose top edge faces `yaw`."""
+    h = size / 2
+    up = np.array([math.cos(yaw), math.sin(yaw)])
+    rt = np.array([math.sin(yaw), -math.cos(yaw)])
+    c = np.array([x, y])
+    return np.array([c + h * up - h * rt, c + h * up + h * rt, c - h * up + h * rt, c - h * up - h * rt])
+
+
+def calibrate_floor_auto(camera, mean_corners, size, origin=None, xaxis=None, origin_at=(0.0, 0.0), exclude=()):
+    """Camera pose from tags lying anywhere on the floor, none of them surveyed.
+
+    Every card is a square of known size on one plane. That is enough to
+    recover the camera's height and tilt and where every card lies relative
+    to the others: the unknowns are the camera pose and each card's (x, y,
+    yaw), and they are solved together by least squares on the corner pixels.
+    The arena frame is then pinned by two cards: `origin` sits at `origin_at`,
+    and +x points from it toward `xaxis` (without `xaxis`, +x is the origin
+    card's own left-to-right direction, which is less accurate).
+
+    Scale comes entirely from `size`, so measure a printed card: 1 mm wrong on
+    a 150 mm card is 3 cm over 4 m. Returns (FloorMap, anchors, report), with
+    anchors = dict id -> dict(x, y, z=0) of where the cards were found."""
+    from .camera import _rvec_from_rot
+    ids = sorted(i for i in mean_corners if i not in set(exclude))
+    if len(ids) < 4:
+        raise ValueError('only %d floor cards seen (%s); throw down at least 5, spread out' % (len(ids), ids))
+    if origin is None:
+        origin = ids[0]
+    if origin not in ids:
+        raise ValueError('origin card %s is not in view (seen: %s)' % (origin, ids))
+    if xaxis is not None and xaxis not in ids:
+        raise ValueError('x-axis card %s is not in view (seen: %s)' % (xaxis, ids))
+    xn = {i: camera.undistort(mean_corners[i][0]) for i in ids}
+
+    def side(i):
+        c = mean_corners[i][0]
+        return min(np.linalg.norm(c[k] - c[(k + 1) % 4]) for k in range(4))
+    ref = max(ids, key=side)                              # start from the card that is biggest in the image
+    fm = FloorMap.solve(camera, mean_corners[ref][0], np.c_[_square(0.0, 0.0, math.pi / 2, size), np.zeros(4)], refine=False)
+    others = [i for i in ids if i != ref]
+    p0 = list(_rvec_from_rot(fm.R)) + list(fm.t)
+    for i in others:                                      # where the first guess puts every other card
+        P = fm.pixel_to_plane(mean_corners[i][0], 0.0)
+        if not np.all(np.isfinite(P)):
+            raise ValueError('card %d cannot be placed on the floor from the first guess; is it lying flat?' % i)
+        up = (P[0] + P[1]) / 2 - (P[2] + P[3]) / 2
+        p0 += [float(P[:, 0].mean()), float(P[:, 1].mean()), math.atan2(up[1], up[0])]
+    p = np.array(p0, float)
+    ref_sq = np.c_[_square(0.0, 0.0, math.pi / 2, size), np.zeros(4)]
+
+    def residual(q):
+        R, t = _rodrigues(q[:3]), q[3:6]
+        out = []
+        for k, i in enumerate([ref] + others):
+            if k == 0:
+                Wd = ref_sq
+            else:
+                x, y, yaw = q[6 + 3 * (k - 1): 9 + 3 * (k - 1)]
+                Wd = np.c_[_square(x, y, yaw, size), np.zeros(4)]
+            Xc = Wd @ R.T + t
+            z = np.where(np.abs(Xc[:, 2]) < 1e-6, 1e-6, Xc[:, 2])
+            out.append((Xc[:, :2] / z[:, None] - xn[i]).ravel())
+        return np.concatenate(out)
+
+    f = float(camera.K[0, 0])
+    lam = 1e-3
+    r = residual(p)
+    cost = float(r @ r)
+    for _ in range(80):                                   # Levenberg-Marquardt, numeric Jacobian
+        J = np.empty((len(r), len(p)))
+        for j in range(len(p)):
+            dq = np.zeros(len(p))
+            dq[j] = 1e-6
+            J[:, j] = (residual(p + dq) - r) / 1e-6
+        A, g = J.T @ J, J.T @ r
+        improved = False
+        for _ in range(8):
+            try:
+                step = np.linalg.solve(A + lam * np.diag(np.diag(A) + 1e-12), -g)
+            except np.linalg.LinAlgError:
+                lam *= 10
+                continue
+            r2 = residual(p + step)
+            c2 = float(r2 @ r2)
+            if c2 < cost:
+                small = (cost - c2) < 1e-14 * max(cost, 1e-30) or np.abs(step).max() < 1e-10
+                p, r, cost, lam, improved = p + step, r2, c2, max(lam / 5, 1e-9), True
+                break
+            lam *= 5
+        if not improved or small:
+            break
+    R, t = _rodrigues(p[:3]), p[3:6]
+    cards = {ref: (0.0, 0.0, math.pi / 2)}
+    for k, i in enumerate(others):
+        cards[i] = tuple(float(v) for v in p[6 + 3 * k: 9 + 3 * k])
+    if (-R.T @ t)[2] < 0:
+        raise ValueError('solution puts the camera under the floor; a card id is probably duplicated or misread')
+    # pin the arena frame to the origin (and x-axis) cards
+    ox, oy, oyaw = cards[origin]
+    if xaxis is not None:
+        th = math.atan2(cards[xaxis][1] - oy, cards[xaxis][0] - ox)
+        base = math.hypot(cards[xaxis][0] - ox, cards[xaxis][1] - oy)
+    else:
+        th = oyaw - math.pi / 2                           # the card's left-to-right direction
+        base = None
+    c, s_ = math.cos(-th), math.sin(-th)
+    Rz = np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1]])   # old frame -> new frame rotation
+    o_new = np.array([origin_at[0], origin_at[1], 0.0])
+    c_old = np.array([ox, oy, 0.0])
+    R_new = R @ Rz.T
+    t_new = R @ (c_old - Rz.T @ o_new) + t
+    fm = FloorMap(camera, R_new, t_new)
+    anchors = {}
+    for i, (x, y, yaw) in cards.items():
+        q = Rz @ (np.array([x, y, 0.0]) - c_old) + o_new
+        anchors[i] = dict(x=float(q[0]), y=float(q[1]), z=0.0)
+    # how good is it
+    px_err = np.sqrt(np.mean(r.reshape(-1, 2) ** 2 * 1.0)) * f * math.sqrt(2)
+    sizes = []
+    for i in ids:
+        P = fm.pixel_to_plane(mean_corners[i][0], 0.0)
+        sizes.append(float(np.mean([np.linalg.norm(P[k] - P[(k + 1) % 4]) for k in range(4)])))
+    size_err = float(np.max(np.abs(np.array(sizes) - size)) / size)
+    xy = np.array([[a['x'], a['y']] for a in anchors.values()])
+    sv = np.linalg.svd(xy - xy.mean(0), compute_uv=False)
+    problems = []
+    if len(ids) < 6:
+        problems.append('only %d cards: use 6 or more for a result you can trust' % len(ids))
+    if sv[1] < 0.2 * sv[0] or sv[1] < 0.4:
+        problems.append('the cards are nearly in a line (spread %.1f m by %.1f m); scatter them over the whole floor'
+                        % (sv[0], sv[1]))
+    if sv[0] < 1.5:
+        problems.append('the cards span only %.1f m; put some at the far side of the floor' % sv[0])
+    if xaxis is None:
+        problems.append('no x-axis card given: +x comes from how card %d happens to be turned' % origin)
+    elif base < 1.0:
+        problems.append('origin and x-axis cards are only %.2f m apart; put them 2 m or more apart' % base)
+    if px_err > 1.5:
+        problems.append('corner fit is %.1f px: a card is not flat, is curled, or its size differs from %.0f mm'
+                        % (px_err, 1e3 * size))
+    grade = 'bad' if (px_err > 3.0 or size_err > 0.08) else ('usable' if problems else 'good')
+    rep = dict(reproj_rms_px=float(px_err), size_max_error=size_err, cards_used=ids, n_points=4 * len(ids),
+               origin=origin, xaxis=xaxis, spread_m=[float(sv[0]), float(sv[1])], problems=problems, grade=grade,
+               floor_rms_m=float(np.sqrt(np.mean((np.array(sizes) - size) ** 2))), auto=True)
+    fm.info = dict(reproj_rms_px=float(px_err), n_points=4 * len(ids), auto=True)
+    return fm, anchors, rep
+
+
+# --------------------------------------------------------------------------
 #  Mount planning
 # --------------------------------------------------------------------------
 

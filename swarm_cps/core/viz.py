@@ -74,6 +74,10 @@ class TopDown:
                 if lg['work']:
                     p2, _ = r.lane_samples(0.0, lg['s0'], lg['s1'], 0.08)
                     cv2.polylines(img, [np.array([self.pt(x, y) for x, y in p2], np.int32)], False, (150, 190, 150), 2, cv2.LINE_AA)
+            for sr in getattr(ctl, 'solo', {}).values():
+                j0, j1 = sr.index(0.0), sr.index(sr.length)
+                sp = np.array([self.pt(x, y) for x, y in zip(sr.x[j0:j1:4], sr.y[j0:j1:4])], np.int32)
+                cv2.polylines(img, [sp], False, (200, 170, 200), 1, cv2.LINE_AA)
             if ctl.leader in ctl.s:
                 for name, (sx, sy, _) in ctl.slot_positions().items():
                     cv2.circle(img, self.pt(sx, sy), int(0.05 * self.k), (150, 150, 150), 1, cv2.LINE_AA)
